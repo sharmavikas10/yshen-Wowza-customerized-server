@@ -51,6 +51,7 @@ public class CupertinoServer3 extends HTTPProvider2Base {
 			OutputStream out = resp.getOutputStream();
 			out.write(retStr.getBytes());
 			resp.setHeader("Cache-Control", "private, no-cache, no-store");
+			resp.setHeader("Content-Type", "application/vnd.apple.mpegurl");
 		} catch (IOException e) {
 			e.printStackTrace();
 		}
