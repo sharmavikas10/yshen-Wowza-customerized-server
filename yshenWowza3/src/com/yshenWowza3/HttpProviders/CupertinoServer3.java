@@ -19,6 +19,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.regex.Pattern;
+import java.util.regex.Matcher;
 
 import com.wowza.wms.http.HTTPProvider2Base;
 import com.wowza.wms.http.IHTTPRequest;
@@ -28,7 +30,6 @@ import com.wowza.wms.vhost.IVHost;
 
 
 public class CupertinoServer3 extends HTTPProvider2Base {
-	//static String Server_ID = null;
 	
 	public void onHTTPRequest(IVHost vhost, IHTTPRequest req, IHTTPResponse resp) {
 		if (!doHTTPAuthentication(vhost, req, resp))
@@ -38,11 +39,17 @@ public class CupertinoServer3 extends HTTPProvider2Base {
 		try {
 			if (requestURL.toLowerCase().indexOf("initsystem") != -1) {
 				String queryParameter = req.getQueryString();
-				queryParameter = queryParameter.substring(queryParameter.indexOf('=') + 1);
-				MasterPlaylistCollection.serverIP = queryParameter;
-				retStr = "system init successfully!\nServerID = " + queryParameter + '\n';
+				String myPatternStr = "ServerID=(\\d{1})&CloudFrontDNS=([\\w\\.]+)$";
+				Pattern myPattern = Pattern.compile(myPatternStr);
+				Matcher matcher = myPattern.matcher(queryParameter);
+				String ServerID = matcher.group(1);
+				String CloudFrontDNS = matcher.group(2);
+				MasterPlaylistCollection.ServerID = ServerID;
+				MasterPlaylistCollection.CloudFrontDNS = CloudFrontDNS;
+				MediaPlaylistCollection.CloudFrontDNS = CloudFrontDNS;
+				retStr = "system init successfully!\nServerID = " + ServerID + "CloudFrontDNS= " + CloudFrontDNS + '\n';
 			} else if (requestURL.toLowerCase().endsWith("masterlist.m3u8")) {
-				String localMasterPlaylist = MasterPlaylistCollection.GetMasterPlaylist();
+				String localMasterPlaylist = MasterPlaylistCollection.GetMasterPlaylist(requestURL);
 				retStr = localMasterPlaylist;
 			} else if (requestURL.toLowerCase().indexOf("chunklist_b") != -1) {
 				String mediaPlaylist = MediaPlaylistCollection.GetMediaPlaylists(requestURL);
@@ -51,6 +58,7 @@ public class CupertinoServer3 extends HTTPProvider2Base {
 			OutputStream out = resp.getOutputStream();
 			out.write(retStr.getBytes());
 			resp.setHeader("Cache-Control", "private, no-cache, no-store");
+			resp.setHeader("Content-Type", "application/vnd.apple.mpegurl");
 		} catch (IOException e) {
 			e.printStackTrace();
 		}
@@ -60,22 +68,23 @@ public class CupertinoServer3 extends HTTPProvider2Base {
 }
 
 class MasterPlaylistCollection {
-	static String originalMasterPlaylist = null;
-	static String masterPlaylistRequest = "http://54.245.88.133:1935/WowzaLiveCFApp1/smil:rtmpElemental.smil/playlist.m3u8";
-	static List<String> masterPlaylistSet = new ArrayList<>();
-	static String serverIP = null;
+	static HashMap<String, String> originalMasterPlaylists = new HashMap<>();
+	static HashMap<String, ArrayList<String>> masterPlaylistSet = new HashMap<String, ArrayList<String> >();
+	static String ServerID = null;
+	static String CloudFrontDNS = null;
 	static double[] probabilityDistribution = new double[] {0.1, 0.3, 0.6}; 
 	static int[] delay = new int[]{0, 1, 2};
 	
-	static void InitMasterPlaylist() throws IOException {
-		if (originalMasterPlaylist !=null){
-			return;
+	static void InitMasterPlaylist(String AppName, String StreamName) throws IOException {
+		if (originalMasterPlaylists.containsKey(StreamName)) {
+			return; 
 		}
 		synchronized (MasterPlaylistCollection.class)
 		{
-			if(originalMasterPlaylist !=null){
+			if(originalMasterPlaylists.containsKey(StreamName)){
 				return;
 			}
+			String masterPlaylistRequest = String.format("http://localhost:1935/%s/smil:%s.smil/playlist.m3u8", AppName, StreamName);
 			String tmpMasterPlaylist = MyHttpClient.Get(masterPlaylistRequest).get("content");
 			String[] lines = tmpMasterPlaylist.split("\\r?\\n");
 			StringBuilder builder = new StringBuilder();
@@ -85,83 +94,81 @@ class MasterPlaylistCollection {
 			}
 			for (int k = 0; k < lines.length; k++) {
 				lines[k] = lines[k];//.replaceFirst("chunklist", "mediaplaylist").replace("m3u8","m3u8");
-				builder.append(lines[k]+'\n');
+				builder.append(lines[k] + "\n");
 				if (lines[k].startsWith("chunklist_b")) {
 					for (int j = 0; j != probabilityDistribution.length; j++){
-						delayVersionBuilder[j].append(lines[k] + String.format("?delay=%d&Server_ID=%s\n", delay[j], serverIP));
+						delayVersionBuilder[j].append("http://" + CloudFrontDNS + String.format("/%s/%s/Group%s/", AppName,
+								StreamName, ServerID) + lines[k] + String.format("?Delay=%d\n", delay[j]));
 					}
 				} else {
 					for (int j = 0; j != probabilityDistribution.length; j++){
-						delayVersionBuilder[j].append(lines[k] + '\n');
+						delayVersionBuilder[j].append(lines[k] + "\n");
 					}
 				}
 			}
-			originalMasterPlaylist = builder.toString();
+			originalMasterPlaylists.put(StreamName, builder.toString() );// = builder.toString();
+			ArrayList<String> tmpList = new ArrayList<>();
 			for (int k = 0; k != probabilityDistribution.length; k++) {
-				masterPlaylistSet.add(delayVersionBuilder[k].toString());
+				tmpList.add(delayVersionBuilder[k].toString());
 			}
+			masterPlaylistSet.put(StreamName, tmpList);
 		}
 	}
 	
-	static String GetMasterPlaylist(int index) throws IOException {
-		InitMasterPlaylist();
-		return masterPlaylistSet.get(index);
-	}
 	
-	static String GetMasterPlaylist() throws IOException {
-		InitMasterPlaylist();
+	static String GetMasterPlaylist(String requestURL) throws IOException {
+		//http://WowzaGroupyshenGroupID/AppName/$StreamName/masterlist.m3u8;
+		String myPatternStr = "^\\/?(\\w+)\\/(\\w+)\\/masterlist\\.m3u8";
+		Pattern myPattern = Pattern.compile(myPatternStr);
+		Matcher matcher = myPattern.matcher(requestURL);
+		String AppName = matcher.group(1);
+		String StreamName = matcher.group(2);
+
+		InitMasterPlaylist(AppName, StreamName);
 		double randNum = Math.random();
 		double accumulateProbability = 0;
 		for (int k = 0; k != probabilityDistribution.length; k++){
 			accumulateProbability += probabilityDistribution[k];
 			if (randNum <= accumulateProbability) {
-				return masterPlaylistSet.get(k);
+				return masterPlaylistSet.get(StreamName).get(k);
 			}
 		}
 		return null;
 	}
 	
-	static String GetOriginalMasterPlaylist() throws IOException {
-		InitMasterPlaylist();
-		return originalMasterPlaylist;
-	}
 }
 
 class MediaPlaylistCollection {
 	static long lastUpdateTime = -1;
-	static int updatePeriod = 1000;
+	static int updatePeriod = 2000;
 	static double[] probabilityDistribution = new double[] {0.1, 0.3, 0.6}; 
 	static int[] delay = new int[]{0, 1, 2};
-	//static String segmentURLPrefix = "http://dwfjco7l53l6c.cloudfront.net/WowzaLiveCFApp1/smil:rtmpElemental.smil/";
-	static String masterPlaylistRequest = "http://54.245.88.133:1935/WowzaLiveCFApp1/smil:rtmpElemental.smil/playlist.m3u8";
-	//static String mediaPlaylistRequestTemplate = "http://localhost:1935/WowzaLiveCFApp1/smil:rtmpElemental.smil/chunklist_%s.m3u8";
-	static List<String> originalMediaPlaylists = null;  //  [rendition]
-	static HashMap<String, String> originalMediaPlaylistsHashTable = null;  //  [rendition]
+	static HashMap<String, HashMap<String, String> > originalMediaPlaylistsHashTable = new HashMap<>();  //  [rendition]
 	static int mediaPlaylistLength = 3;
-	static ArrayList<ArrayList<String> > mediaPlaylistSet = null;  //  [rendition][delay]
-	static HashMap<String, ArrayList<String> > mediaPlaylistSetHashTable = null;  //  [rendition][delay]
+	static HashMap<String, HashMap<String, ArrayList<String> > >mediaPlaylistSetHashTable = new HashMap<>();  //  [rendition][delay]
 	static final ReadWriteLock timeStampLock = new ReentrantReadWriteLock();
 	static final ReadWriteLock mediaPlaylistsLock = new ReentrantReadWriteLock();
-	static String masterPlaylist = null;
-	
-	static void Update() throws IOException {
-		if (masterPlaylist == null) {
-			masterPlaylist = MyHttpClient.Get(masterPlaylistRequest).get("content");
+	static HashMap<String, String> masterPlaylist = new HashMap<>();
+	static String CloudFrontDNS = null;
+	static void Update(String appName, String streamName, String groupID, String RenditionInRequest, int DelayInRequest) throws IOException {
+		if (masterPlaylist.containsKey(streamName)) {
+			synchronized (MasterPlaylistCollection.class) {
+				if (masterPlaylist.containsKey(streamName)){
+					String masterPlaylistRequest = String.format("http://localhost:1935/%s/smil:%s.smil/playlist.m3u8", appName, streamName);
+					masterPlaylist.put(streamName, MyHttpClient.Get(masterPlaylistRequest).get("content"));
+               }
+			}
 		}
-		String[] lines = masterPlaylist.split("\\r?\\n");
-		originalMediaPlaylists = new ArrayList<>();
-		mediaPlaylistSet = new ArrayList<>();
-		originalMediaPlaylistsHashTable = new HashMap<>();
-		mediaPlaylistSetHashTable = new HashMap<>();
+		String[] lines = masterPlaylist.get(streamName).split("\\r?\\n");
+		HashMap<String, String> oneStreamOriginalMediaPlaylistsHashTable = new HashMap<>(); //store the media playlist for this stream only; key is the rendition
+		HashMap<String, ArrayList<String> > oneStreamMediaPlaylistSetHashTable = new HashMap<>();
 		for (int k = 0; k < lines.length; k++) {
 			if (lines[k].startsWith("#EXT-X-STREAM-INF")) {
 				String rendition = lines[k+1].substring(lines[k+1].lastIndexOf("_b") + 1, lines[k+1].lastIndexOf(".m3u8"));
-				//String mediaPlaylistRequest = String.format(mediaPlaylistRequestTemplate, rendition);
-				String mediaPlaylistRequest =  "http://54.245.88.133:1935/WowzaLiveCFApp1/rtmpElemental/chunklist.m3u8";
+				String mediaPlaylistRequest =  String.format("http://localhost:1935/%s/%s/chunklist.m3u8", appName, streamName);
 				String originalMediaPlaylist = MyHttpClient.Get(mediaPlaylistRequest).get("content");
 				originalMediaPlaylist = originalMediaPlaylist.replaceAll("media", "media_" + rendition);
-				originalMediaPlaylists.add(originalMediaPlaylist);
-				originalMediaPlaylistsHashTable.put(rendition, originalMediaPlaylist);
+				oneStreamOriginalMediaPlaylistsHashTable.put(rendition, originalMediaPlaylist);
 				String[] mediaPlaylistLines = originalMediaPlaylist.split("\\r?\\n");
 				String headPart = "";
 				ArrayList<String[]> bodyPartLines = new ArrayList<>();
@@ -169,72 +176,68 @@ class MediaPlaylistCollection {
 				int j = 0;
 				for (j = 0; j != mediaPlaylistLines.length; j++){
 					if (mediaPlaylistLines[j].startsWith("#EXTINF") == false) {
-						headPart += mediaPlaylistLines[j] + '\n';
+						headPart += mediaPlaylistLines[j] + "\n";
 					} else {
 						break;
 					}
 				}
 				for (int d = 0; d < delay.length; d++) {
-					bodyPartLines.add(Arrays.copyOfRange(mediaPlaylistLines, j + delay[delay.length - 1 - d] * 2, j + delay[delay.length - 1 - d] * 2 + mediaPlaylistLength * 2));
+					bodyPartLines.add(Arrays.copyOfRange(mediaPlaylistLines, j +
+							delay[delay.length - 1 - d] * 2, j + delay[delay.length - 1 - d] * 2 + mediaPlaylistLength * 2));
 					String tmpStr = headPart;
 					for (int i = 0; i < bodyPartLines.get(d).length; i += 1) {
-						tmpStr += bodyPartLines.get(d)[i] + '\n';
+						if (bodyPartLines.get(d)[i].startsWith("#EXTINF")) {
+							tmpStr += bodyPartLines.get(d)[i] + "\n";
+						} else {
+							tmpStr += String.format("http://%s/%s/smil:%s.smil/Group%s/%s",
+									CloudFrontDNS, appName, streamName, groupID, bodyPartLines.get(d)[i] + '\n');  
+						}
 					}
 					delaySet.add(tmpStr);
 				}
-				mediaPlaylistSet.add(delaySet);	
-				mediaPlaylistSetHashTable.put(rendition, delaySet);
+				oneStreamMediaPlaylistSetHashTable.put(rendition, delaySet);
 			}
 		}
+		originalMediaPlaylistsHashTable.put(streamName, oneStreamOriginalMediaPlaylistsHashTable);
+		mediaPlaylistSetHashTable.put(streamName, oneStreamMediaPlaylistSetHashTable);
 		lastUpdateTime = System.currentTimeMillis();
 	}	
 	
 	static String GetMediaPlaylists(String mediaPlaylistURL) throws IOException {
-		int delayInRequest = Integer.parseInt(mediaPlaylistURL.substring(mediaPlaylistURL.indexOf("delay=") + 6, mediaPlaylistURL.lastIndexOf('&')));
-		String rendition = mediaPlaylistURL.substring(mediaPlaylistURL.lastIndexOf("chunklist_b") + 10, mediaPlaylistURL.lastIndexOf(".m3u8"));
-		String serverid = mediaPlaylistURL.substring(mediaPlaylistURL.lastIndexOf("Server_ID=") + 10);
+		//proxy_pass http://WowzaGroup$GroupID/AppName/$StreamName/Group$GroupID/chunklist_$Bandwidth.m3u8?Delay=$Delay;
+		String myPatternStr = "\\/?(\\w+)\\/(\\w+)\\/Group(\\d{1})\\/chunklist_(b\\d+)\\.m3u8\\?Delay=(\\d{1})";
+		Pattern myPattern = Pattern.compile(myPatternStr);
+		Matcher matcher = myPattern.matcher(mediaPlaylistURL); 
+		String appName = matcher.group(1);
+		String streamName = matcher.group(2);
+		String groupID = matcher.group(3);
+		String renditionInRequest = matcher.group(4);
+		int delayInRequest = Integer.parseInt(matcher.group(5));
 		long currentTime = System.currentTimeMillis();
 		timeStampLock.readLock().lock();
 		if (currentTime - lastUpdateTime >= updatePeriod) {
 			timeStampLock.readLock().unlock();
 			timeStampLock.writeLock().lock();
 			if (currentTime - lastUpdateTime >= updatePeriod) {
-				Update();
+				Update(appName, streamName, groupID, renditionInRequest, delayInRequest);
 			}
-			String retMediaPlaylist = mediaPlaylistSetHashTable.get(rendition).get(delayInRequest); 
+			String retMediaPlaylist = mediaPlaylistSetHashTable.get(streamName).get(renditionInRequest).get(delayInRequest); 
 			timeStampLock.writeLock().unlock();
-			retMediaPlaylist = AttachServerID(retMediaPlaylist, serverid);
 			return retMediaPlaylist;
 		} else {
-			String retMediaPlaylist = mediaPlaylistSetHashTable.get(rendition).get(delayInRequest); 
+			String retMediaPlaylist = mediaPlaylistSetHashTable.get(streamName).get(renditionInRequest).get(delayInRequest); 
 			timeStampLock.readLock().unlock();
-			retMediaPlaylist = AttachServerID(retMediaPlaylist, serverid);
 			return retMediaPlaylist;
 		}
 		
 	}
 	
-	static String AttachServerID(String mediaPlaylist, String serverid) {
-		String[] lines = mediaPlaylist.split("\\r?\\n");
-		StringBuilder sb = new StringBuilder();
-		for (int k = 0; k != lines.length; k++) {
-			sb.append(lines[k]);
-			if (lines[k].startsWith("media_b")) {
-				sb.append("?Server_ID=" + serverid);
-			}
-			sb.append('\n');
-		}
-		return sb.toString();
-	}
 }
 
 class MyHttpClient {
 	static HashMap<String, String> Get(String requestStr) throws IOException {
 		HashMap<String, String> response = new HashMap<>();
         URL url = new URL(requestStr);
-       // HttpsURLConnection connection  = (HttpsURLConnection) url.openConnection();
-        
-      //  URL url = new URL("https://www.verisign.com");
         HttpURLConnection connection = (HttpURLConnection)url.openConnection();
         
         response.put("Response-Code", Integer.toString(connection.getResponseCode()));
